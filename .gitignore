@@ -1,5 +1,4 @@
-# Ignore sensitive keys and local environment config
-.env
-
-# Ignore node modules
 node_modules/
+.env
+guild_channels.json
+
