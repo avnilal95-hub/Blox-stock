@@ -7,19 +7,26 @@ const {
   PermissionFlagsBits, 
   REST, 
   Routes,
-  MessageFlags // <-- Added for modern ephemeral flags
+  MessageFlags,
+  ActivityType
 } = require('discord.js');
 const axios = require('axios');
 
+// Initialize Discord Client with appropriate intents
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: [
+    GatewayIntentBits.Guilds, 
+    GatewayIntentBits.GuildMessages
+  ]
 });
 
-// Target channel ID (falls back to process.env.CHANNEL_ID if provided)
-let stockChannelId = process.env.CHANNEL_ID || null;
-let previousStock = [];
+// Storage map for multi-server support: Server ID -> Channel ID
+// Falls back to CHANNEL_ID env variable for single-server testing
+const serverChannelMap = new Map();
+let globalPreviousStock = [];
+let lastCheckTimestamp = null;
 
-// Custom Discord Emoji Mapping for Blox Fruits
+// Complete Mapping of Blox Fruits to Custom Discord Emoji IDs
 const FRUIT_EMOJIS = {
   "Rocket": "<:Rocket:1532341879092285581>",
   "Spin": "<:Spin:1532342070306541680>",
@@ -70,143 +77,259 @@ const FRUIT_EMOJIS = {
   "Dragon": "<:Dragon:1532346315156095157>"
 };
 
-// 1. Slash Command Definition (/set-stock channel:)
+// ==========================================
+// 1. SLASH COMMAND DEFINITIONS
+// ==========================================
 const commands = [
   new SlashCommandBuilder()
     .setName('set-stock')
-    .setDescription('Sets the channel where Blox Fruits stock notifications will be posted.')
+    .setDescription('Configure the channel where Blox Fruits stock notifications will be posted.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
     .addChannelOption(option =>
       option
         .setName('channel')
         .setDescription('Select the target text channel')
         .setRequired(true)
-    )
+    ),
+
+  new SlashCommandBuilder()
+    .setName('stock')
+    .setDescription('Manually fetch and display the current Blox Fruits stock right now.'),
+
+  new SlashCommandBuilder()
+    .setName('bot-info')
+    .setDescription('Display detailed technical diagnostics, ping, and status for the stock bot.')
 ];
 
-// 2. Register Commands
+// ==========================================
+// 2. GLOBAL SLASH COMMAND REGISTRATION
+// ==========================================
 async function registerCommands() {
   try {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    console.log('Registering slash commands...');
+    console.log('[System] Deploying global application (/) commands...');
     
     await rest.put(
       Routes.applicationCommands(client.user.id),
       { body: commands }
     );
 
-    console.log('✅ Registered /set-stock slash command successfully!');
+    console.log('✅ Successfully registered global slash commands across all joined servers!');
   } catch (error) {
-    console.error('Error registering slash commands:', error.message);
+    console.error('❌ Failed to register slash commands:', error.message);
   }
 }
 
-// 3. Stock Checker Function with Error Handling
-async function checkStock() {
-  if (!stockChannelId) {
-    console.log('⚠️ No target channel ID set. Run /set-stock channel: in Discord!');
-    return;
-  }
-
+// ==========================================
+// 3. API FETCHING & DATA PARSING ENGINE
+// ==========================================
+async function fetchRawStockData() {
   const options = {
     method: 'GET',
     url: 'https://blox-fruit-stock-fruit.p.rapidapi.com/',
+    params: { mode: 'normal' },
     headers: {
       'x-rapidapi-host': 'blox-fruit-stock-fruit.p.rapidapi.com',
-      'x-rapidapi-key': process.env.RAPIDAPI_KEY
-    }
+      'x-rapidapi-key': process.env.RAPIDAPI_KEY,
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000 // 10 second safety timeout
   };
 
   try {
     const response = await axios.request(options);
+    if (!response || !response.data) return null;
 
-    // Ensure response data exists
-    if (!response || !response.data) {
-      console.log('⚠️ Empty response from RapidAPI.');
-      return;
+    const raw = response.data;
+    let fruitsList = [];
+
+    // Support multiple JSON response formats
+    if (Array.isArray(raw)) {
+      fruitsList = raw;
+    } else if (raw.fruits && Array.isArray(raw.fruits)) {
+      fruitsList = raw.fruits;
+    } else if (raw.stock && Array.isArray(raw.stock)) {
+      fruitsList = raw.stock;
+    } else if (typeof raw === 'object') {
+      fruitsList = Object.values(raw).filter(item => typeof item === 'object' || typeof item === 'string');
     }
 
-    const stockData = response.data;
-    
-    // Parse response format safely
-    let currentFruits = [];
-    if (Array.isArray(stockData)) {
-      currentFruits = stockData;
-    } else if (stockData.fruits && Array.isArray(stockData.fruits)) {
-      currentFruits = stockData.fruits;
-    } else if (stockData.stock && Array.isArray(stockData.stock)) {
-      currentFruits = stockData.stock;
-    }
-
-    if (currentFruits.length === 0) {
-      console.log('⚠️ No fruit stock data available in current check.');
-      return;
-    }
-
-    const currentStockNames = currentFruits.map(item => typeof item === 'string' ? item : item.name);
-    const hasChanged = JSON.stringify(currentStockNames) !== JSON.stringify(previousStock);
-
-    if (hasChanged) {
-      previousStock = currentStockNames;
-
-      const channel = await client.channels.fetch(stockChannelId);
-      if (!channel) return;
-
-      // Format: {Fruit_img} : {fruit_prize} - {fruit_name}
-      const stockLines = currentFruits.map(fruit => {
-        const fruitName = typeof fruit === 'string' ? fruit : (fruit.name || 'Unknown');
-        const fruitImg = FRUIT_EMOJIS[fruitName] || '🍎'; 
-        const fruitPrice = (fruit && fruit.price) ? `$${fruit.price.toLocaleString()}` : 'In Stock';
-
-        return `${fruitImg} : ${fruitPrice} - ${fruitName}`;
-      }).join('\n');
-
-      const embed = new EmbedBuilder()
-        .setTitle('🏴‍☠️ Blox Fruits Dealer Stock Update')
-        .setColor('#00FF7F')
-        .setTimestamp()
-        .setDescription(stockLines);
-
-      await channel.send({ embeds: [embed] });
-      console.log(`Posted stock update to channel: ${stockChannelId}`);
-    }
+    return fruitsList;
   } catch (error) {
-    if (error.response && error.response.data) {
-      console.error('RapidAPI Remote Error:', error.response.data);
-    } else {
-      console.error('RapidAPI Fetch Error:', error.message);
-    }
+    console.error('[API Gateway Error]:', error.response ? error.response.data : error.message);
+    return null;
   }
 }
 
-// 4. Command Interaction Handler
+// Format stock items into a clean Discord embed list
+function createStockEmbed(fruitsList, isManual = false) {
+  const stockLines = fruitsList.map(fruit => {
+    const fruitName = typeof fruit === 'string' ? fruit : (fruit.name || fruit.title || 'Unknown Fruit');
+    const fruitImg = FRUIT_EMOJIS[fruitName] || '🍎'; 
+    const fruitPrice = (fruit && fruit.price) ? `$${Number(fruit.price).toLocaleString()}` : 'In Stock';
+
+    return `${fruitImg} **${fruitName}** — \`${fruitPrice}\``;
+  }).join('\n');
+
+  const titlePrefix = isManual ? '🔍 Manual Stock Query' : '🏴‍☠️ Blox Fruits Dealer Stock Update';
+
+  return new EmbedBuilder()
+    .setTitle(titlePrefix)
+    .setColor('#00FF7F')
+    .setTimestamp()
+    .setDescription(stockLines || 'No fruit data available at this time.')
+    .setFooter({ 
+      text: `Blox Fruits Stock Monitor • Total Fruits: ${fruitsList.length}`, 
+      iconURL: client.user.displayAvatarURL() 
+    });
+}
+
+// ==========================================
+// 4. PERIODIC MONITOR & BROADCAST LOGIC
+// ==========================================
+async function checkAndBroadcastStock(forceSend = false) {
+  console.log('[Monitor] Executing stock check...');
+  const currentFruits = await fetchRawStockData();
+
+  if (!currentFruits || currentFruits.length === 0) {
+    console.log('[Monitor] Stock check skipped: No data returned from RapidAPI.');
+    return;
+  }
+
+  lastCheckTimestamp = new Date();
+  const currentNames = currentFruits.map(item => typeof item === 'string' ? item : (item.name || item.title));
+  const hasChanged = JSON.stringify(currentNames) !== JSON.stringify(globalPreviousStock);
+
+  if (hasChanged || forceSend) {
+    globalPreviousStock = currentNames;
+    const stockEmbed = createStockEmbed(currentFruits, false);
+
+    // Collect target channels (Default Env Channel + Guild Specific Configs)
+    const targetChannels = new Set();
+    if (process.env.CHANNEL_ID) targetChannels.add(process.env.CHANNEL_ID);
+    for (const channelId of serverChannelMap.values()) {
+      targetChannels.add(channelId);
+    }
+
+    if (targetChannels.size === 0) {
+      console.log('⚠️ No target channels configured. Use /set-stock on a server to set alerts!');
+      return;
+    }
+
+    console.log(`[Broadcast] Sending stock update to ${targetChannels.size} target channel(s)...`);
+
+    for (const channelId of targetChannels) {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (channel && channel.isTextBased()) {
+          await channel.send({ embeds: [stockEmbed] });
+          console.log(`✅ Broadcast successful to Channel ID: ${channelId}`);
+        }
+      } catch (err) {
+        console.error(`❌ Failed to send to channel ${channelId}:`, err.message);
+      }
+    }
+  } else {
+    console.log('[Monitor] Stock has not changed since last check. Skipping broadcast.');
+  }
+}
+
+// ==========================================
+// 5. INTERACTION & COMMAND HANDLERS
+// ==========================================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'set-stock') {
-    const selectedChannel = interaction.options.getChannel('channel');
-    stockChannelId = selectedChannel.id;
+  const { commandName } = interaction;
+
+  // Handler for /set-stock
+  if (commandName === 'set-stock') {
+    const targetChannel = interaction.options.getChannel('channel');
+
+    if (!targetChannel.isTextBased()) {
+      return interaction.reply({
+        content: '❌ Please select a valid text channel!',
+        flags: MessageFlags.Ephemeral
+      });
+    }
+
+    serverChannelMap.set(interaction.guildId, targetChannel.id);
 
     await interaction.reply({
-      content: `✅ Blox Fruits stock alerts will now post to ${selectedChannel}!`,
-      flags: MessageFlags.Ephemeral // Modern flag instead of ephemeral: true
+      content: `✅ Blox Fruits stock alerts for **${interaction.guild.name}** will now post to ${targetChannel}!`,
+      flags: MessageFlags.Ephemeral
     });
 
-    // Run immediate check for newly assigned channel
-    checkStock();
+    // Run immediate check to publish to newly set channel
+    checkAndBroadcastStock(true);
+  }
+
+  // Handler for /stock (On-Demand Query)
+  if (commandName === 'stock') {
+    await interaction.deferReply(); // Prevents interaction timeout during API call
+
+    const currentFruits = await fetchRawStockData();
+
+    if (!currentFruits || currentFruits.length === 0) {
+      return interaction.editReply({
+        content: '⚠️ Failed to fetch live stock data from the server. Please try again in a moment.'
+      });
+    }
+
+    const embed = createStockEmbed(currentFruits, true);
+    await interaction.editReply({ embeds: [embed] });
+  }
+
+  // Handler for /bot-info
+  if (commandName === 'bot-info') {
+    const ping = client.ws.ping;
+    const activeGuilds = client.guilds.cache.size;
+    const configuredChannels = serverChannelMap.size;
+    const lastCheckTime = lastCheckTimestamp ? `<t:${Math.floor(lastCheckTimestamp.getTime() / 1000)}:R>` : 'Never';
+
+    const infoEmbed = new EmbedBuilder()
+      .setTitle('⚙️ Bot Diagnostics & Status')
+      .setColor('#0099FF')
+      .addFields(
+        { name: '📡 Discord Ping', value: `\`${ping}ms\``, inline: true },
+        { name: '🌐 Active Guilds', value: `\`${activeGuilds} servers\``, inline: true },
+        { name: '📢 Configured Alert Channels', value: `\`${configuredChannels} channels\``, inline: true },
+        { name: '⏱️ Last Stock Check', value: lastCheckTime, inline: false }
+      )
+      .setFooter({ text: 'Blox Fruits Alert System v2.0' })
+      .setTimestamp();
+
+    await interaction.reply({ embeds: [infoEmbed], flags: MessageFlags.Ephemeral });
   }
 });
 
-// 5. Client Startup
+// ==========================================
+// 6. BOT STARTUP & ACTIVITY LIFECYCLE
+// ==========================================
 client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  
+  console.log(`==========================================`);
+  console.log(`✅ Logged in successfully as: ${client.user.tag}`);
+  console.log(`🌐 Bot is active in ${client.guilds.cache.size} server(s)`);
+  console.log(`==========================================`);
+
+  // Register slash commands globally on startup
   await registerCommands();
 
-  // Initial check on boot + check every 15 minutes
-  checkStock();
-  setInterval(checkStock, 15 * 60 * 1000);
+  // Set initial status presence
+  client.user.setPresence({
+    activities: [{ name: 'Blox Fruits Dealer Stock | /stock', type: ActivityType.Watching }],
+    status: 'online'
+  });
+
+  // Run stock check immediately on boot
+  checkAndBroadcastStock();
+
+  // Loop stock check every 15 minutes (900,000 ms)
+  setInterval(() => {
+    checkAndBroadcastStock();
+  }, 15 * 60 * 1000);
 });
 
+// Log in bot using token
 client.login(process.env.DISCORD_TOKEN);
-                                                               
+    
