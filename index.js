@@ -6,7 +6,8 @@ const {
   SlashCommandBuilder, 
   PermissionFlagsBits, 
   REST, 
-  Routes 
+  Routes,
+  MessageFlags // <-- Added for modern ephemeral flags
 } = require('discord.js');
 const axios = require('axios');
 
@@ -14,7 +15,7 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
 });
 
-// Channel ID to post updates (Can be overridden dynamically via /set-stock command)
+// Target channel ID (falls back to process.env.CHANNEL_ID if provided)
 let stockChannelId = process.env.CHANNEL_ID || null;
 let previousStock = [];
 
@@ -83,7 +84,7 @@ const commands = [
     )
 ];
 
-// 2. Register Slash Commands with Discord Gateway
+// 2. Register Commands
 async function registerCommands() {
   try {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -100,7 +101,7 @@ async function registerCommands() {
   }
 }
 
-// 3. Stock Checker Function
+// 3. Stock Checker Function with Error Handling
 async function checkStock() {
   if (!stockChannelId) {
     console.log('⚠️ No target channel ID set. Run /set-stock channel: in Discord!');
@@ -111,7 +112,6 @@ async function checkStock() {
     method: 'GET',
     url: 'https://blox-fruit-stock-fruit.p.rapidapi.com/',
     headers: {
-      'Content-Type': 'application/json',
       'x-rapidapi-host': 'blox-fruit-stock-fruit.p.rapidapi.com',
       'x-rapidapi-key': process.env.RAPIDAPI_KEY
     }
@@ -119,12 +119,31 @@ async function checkStock() {
 
   try {
     const response = await axios.request(options);
+
+    // Ensure response data exists
+    if (!response || !response.data) {
+      console.log('⚠️ Empty response from RapidAPI.');
+      return;
+    }
+
     const stockData = response.data;
-    const currentFruits = Array.isArray(stockData) ? stockData : (stockData.fruits || stockData.stock || []);
+    
+    // Parse response format safely
+    let currentFruits = [];
+    if (Array.isArray(stockData)) {
+      currentFruits = stockData;
+    } else if (stockData.fruits && Array.isArray(stockData.fruits)) {
+      currentFruits = stockData.fruits;
+    } else if (stockData.stock && Array.isArray(stockData.stock)) {
+      currentFruits = stockData.stock;
+    }
 
-    if (currentFruits.length === 0) return;
+    if (currentFruits.length === 0) {
+      console.log('⚠️ No fruit stock data available in current check.');
+      return;
+    }
 
-    const currentStockNames = currentFruits.map(item => item.name || item);
+    const currentStockNames = currentFruits.map(item => typeof item === 'string' ? item : item.name);
     const hasChanged = JSON.stringify(currentStockNames) !== JSON.stringify(previousStock);
 
     if (hasChanged) {
@@ -133,11 +152,11 @@ async function checkStock() {
       const channel = await client.channels.fetch(stockChannelId);
       if (!channel) return;
 
-      // Formatting: {Fruit_img} : {fruit_prize} - {fruit_name}
+      // Format: {Fruit_img} : {fruit_prize} - {fruit_name}
       const stockLines = currentFruits.map(fruit => {
-        const fruitName = fruit.name || fruit;
+        const fruitName = typeof fruit === 'string' ? fruit : (fruit.name || 'Unknown');
         const fruitImg = FRUIT_EMOJIS[fruitName] || '🍎'; 
-        const fruitPrice = fruit.price ? `$${fruit.price.toLocaleString()}` : 'In Stock';
+        const fruitPrice = (fruit && fruit.price) ? `$${fruit.price.toLocaleString()}` : 'In Stock';
 
         return `${fruitImg} : ${fruitPrice} - ${fruitName}`;
       }).join('\n');
@@ -152,11 +171,15 @@ async function checkStock() {
       console.log(`Posted stock update to channel: ${stockChannelId}`);
     }
   } catch (error) {
-    console.error('RapidAPI Fetch Error:', error.response ? error.response.data : error.message);
+    if (error.response && error.response.data) {
+      console.error('RapidAPI Remote Error:', error.response.data);
+    } else {
+      console.error('RapidAPI Fetch Error:', error.message);
+    }
   }
 }
 
-// 4. Handle Command Interactions
+// 4. Command Interaction Handler
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -166,24 +189,24 @@ client.on('interactionCreate', async (interaction) => {
 
     await interaction.reply({
       content: `✅ Blox Fruits stock alerts will now post to ${selectedChannel}!`,
-      ephemeral: true
+      flags: MessageFlags.Ephemeral // Modern flag instead of ephemeral: true
     });
 
-    // Check stock immediately for the newly selected channel
+    // Run immediate check for newly assigned channel
     checkStock();
   }
 });
 
-// 5. Bot Startup Logic
+// 5. Client Startup
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   
   await registerCommands();
 
-  // Run stock check immediately on launch, then loop every 15 minutes
+  // Initial check on boot + check every 15 minutes
   checkStock();
   setInterval(checkStock, 15 * 60 * 1000);
 });
 
 client.login(process.env.DISCORD_TOKEN);
-                                                                  
+                                                               
