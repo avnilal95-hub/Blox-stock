@@ -3,17 +3,27 @@ const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('disc
 const commands = [
   new SlashCommandBuilder()
     .setName('set-stock')
-    .setDescription('Set the channel where live Blox Fruits stock notifications will be posted.')
+    .setDescription('Set the channel and stock type for automatic 4-hour updates.')
     .addChannelOption(option =>
       option.setName('channel')
         .setDescription('The text channel for stock alerts')
         .setRequired(true)
     )
+    .addStringOption(option =>
+      option.setName('type')
+        .setDescription('Select the type of stock to monitor')
+        .setRequired(true)
+        .addChoices(
+          { name: 'Normal Dealer Stock', value: 'normal' },
+          { name: 'Mirage Island Stock', value: 'mirage' },
+          { name: 'Both (Normal & Mirage)', value: 'both' }
+        )
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
     .setName('remove-stock')
-    .setDescription('Stop receiving stock notifications in this server.')
+    .setDescription('Stop automatic stock notifications in this server.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
 
   new SlashCommandBuilder()
@@ -44,4 +54,3 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     console.error('❌ Failed to register commands:', error);
   }
 })();
-
